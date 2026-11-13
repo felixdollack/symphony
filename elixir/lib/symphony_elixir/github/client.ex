@@ -5,6 +5,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
   require Logger
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.ReviewJob
   alias SymphonyElixir.Tracker.Issue
 
   @default_api_url "https://api.github.com"
@@ -32,12 +33,42 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(state_names) when is_list(state_names) do
-    fetch_issues_by_states(state_names, Config.settings!().tracker, &perform_request/5)
+    tracker_settings = Config.settings!().tracker
+
+    with {:ok, issues} <- fetch_issues_by_states(state_names, tracker_settings, &perform_request/5),
+         {:ok, github_settings} <- settings(tracker_settings) do
+      issues
+      |> Enum.map(fn issue -> hydrate_review_head(issue, github_settings, &perform_request/5, false) end)
+      |> Enum.flat_map(&ReviewJob.expand/1)
+      |> then(&{:ok, &1})
+    end
   end
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) when is_list(issue_ids) do
-    fetch_issues_by_ids(issue_ids, Config.settings!().tracker, &perform_request/5)
+    base_ids = issue_ids |> Enum.map(&base_issue_id/1) |> Enum.uniq()
+    tracker_settings = Config.settings!().tracker
+
+    with {:ok, issues} <- fetch_issues_by_ids(base_ids, tracker_settings, &perform_request/5),
+         {:ok, github_settings} <- settings(tracker_settings) do
+      issues
+      |> Enum.map(fn issue ->
+        hydrate_review_head(issue, github_settings, &perform_request/5, true)
+      end)
+      |> then(&{:ok, ReviewJob.select_requested(&1, issue_ids)})
+    end
+  end
+
+  @spec verify_review_completion(Issue.t()) :: :ok | {:error, term()}
+  def verify_review_completion(%Issue{} = issue) do
+    verify_review_completion(issue, Config.settings!().tracker, &perform_request/5)
+  end
+
+  @doc false
+  @spec verify_review_completion_for_test(Issue.t(), map(), function()) :: :ok | {:error, term()}
+  def verify_review_completion_for_test(%Issue{} = issue, tracker_settings, request_fun)
+      when is_map(tracker_settings) and is_function(request_fun, 5) do
+    verify_review_completion(issue, tracker_settings, request_fun)
   end
 
   @spec request(String.t(), String.t(), map(), term(), keyword()) ::
@@ -210,7 +241,8 @@ defmodule SymphonyElixir.GitHub.Client do
       "id" => issue["id"],
       "node_id" => issue["node_id"],
       "number" => issue["number"],
-      "repo" => repo
+      "repo" => repo,
+      "pull_request" => Map.has_key?(issue, "pull_request")
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
@@ -219,6 +251,129 @@ defmodule SymphonyElixir.GitHub.Client do
       ref -> ref
     end
   end
+
+  defp base_issue_id(id) when is_binary(id) do
+    case ReviewJob.parse_review_id(id) do
+      {:ok, number, _profile} -> number
+      :error -> id
+    end
+  end
+
+  defp hydrate_review_head(%Issue{native_ref: %{"pull_request" => true} = native_ref} = issue, settings, request_fun, force?) do
+    labels = MapSet.new(issue.labels, &String.downcase/1)
+
+    if force? or MapSet.member?(labels, "claude-review") or MapSet.member?(labels, "codex-review") do
+      number = native_ref["number"]
+
+      case request_with_settings(
+             "GET",
+             repository_pull_request_path(settings, number),
+             %{},
+             nil,
+             settings,
+             request_fun,
+             true
+           ) do
+        {:ok, %{"head" => %{"sha" => sha}}} when is_binary(sha) ->
+          %{issue | native_ref: Map.put(native_ref, "head_sha", sha)}
+
+        result ->
+          Logger.warning("Skipping labeled GitHub pull request without a pinned head issue_id=#{issue.id} issue_identifier=#{issue.identifier} result=#{inspect(result)}")
+
+          issue
+      end
+    else
+      issue
+    end
+  end
+
+  defp hydrate_review_head(issue, _settings, _request_fun, _force?), do: issue
+
+  defp verify_review_completion(issue, tracker_settings, request_fun) do
+    ref = issue.native_ref || %{}
+    number = ref["number"]
+    expected_sha = ref["head_sha"]
+    marker = "<!-- symphony-review:#{ref["job_id"]} -->"
+    own_label = "#{issue.agent_profile}-review"
+
+    with {:ok, github_settings} <- settings(tracker_settings),
+         {:ok, current_issue} <-
+           request_with_settings(
+             "GET",
+             repository_issue_path(github_settings, number),
+             %{},
+             nil,
+             github_settings,
+             request_fun,
+             false
+           ),
+         {:ok, current_pr} <-
+           request_with_settings(
+             "GET",
+             repository_pull_request_path(github_settings, number),
+             %{},
+             nil,
+             github_settings,
+             request_fun,
+             false
+           ),
+         {:ok, reviews} <-
+           request_with_settings(
+             "GET",
+             "#{repository_pull_request_path(github_settings, number)}/reviews",
+             %{},
+             nil,
+             github_settings,
+             request_fun,
+             false
+           ),
+         true <- is_map(current_issue) and is_map(current_pr) and is_list(reviews),
+         :ok <- restore_review_label_for_stale_head(current_issue, current_pr, github_settings, issue, request_fun),
+         true <- current_pr["head"]["sha"] == expected_sha,
+         true <- not Enum.any?(extract_labels(current_issue), &(String.downcase(&1) == own_label)),
+         true <- Enum.any?(reviews, &matching_review?(&1, expected_sha, marker)) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :github_review_not_completed}
+    end
+  end
+
+  defp restore_review_label_for_stale_head(current_issue, current_pr, github_settings, issue, request_fun) do
+    native_ref = issue.native_ref || %{}
+    expected_sha = native_ref["head_sha"]
+    current_sha = get_in(current_pr, ["head", "sha"])
+    own_label = "#{issue.agent_profile}-review"
+
+    label_present? = Enum.any?(extract_labels(current_issue), &(String.downcase(&1) == own_label))
+
+    if is_binary(expected_sha) and is_binary(current_sha) and current_sha != expected_sha and not label_present? do
+      case request_with_settings(
+             "POST",
+             repository_issue_path(github_settings, native_ref["number"]) <> "/labels",
+             %{},
+             %{"labels" => [own_label]},
+             github_settings,
+             request_fun,
+             false
+           ) do
+        {:ok, _payload} ->
+          :ok
+
+        {:error, reason} ->
+          {:error, {:github_review_label_restore_failed, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp matching_review?(%{"commit_id" => sha, "body" => body, "state" => state}, expected_sha, marker) do
+    sha == expected_sha and state in ["COMMENTED", "APPROVED", "CHANGES_REQUESTED"] and
+      is_binary(body) and String.contains?(body, marker)
+  end
+
+  defp matching_review?(_review, _expected_sha, _marker), do: false
 
   defp extract_labels(%{"labels" => labels}) when is_list(labels) do
     labels
@@ -345,6 +500,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp repository_issue_path(settings, issue_number),
     do: "#{repository_issues_path(settings)}/#{issue_number}"
+
+  defp repository_pull_request_path(settings, pr_number),
+    do: "/repos/#{encoded_repo(settings.repo)}/pulls/#{pr_number}"
 
   defp encoded_repo(repo) do
     repo

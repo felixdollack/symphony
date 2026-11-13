@@ -894,6 +894,208 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "review label reconciliation permits only an orchestrator-authorized removal" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: ["symphony"],
+      tracker_active_states: ["In Progress"]
+    )
+
+    issue_id = "42@claude-review"
+
+    issue =
+      %Issue{
+        id: issue_id,
+        identifier: "GH-42-claude-review",
+        state: "In Progress",
+        title: "Review PR",
+        labels: ["symphony", "claude-review"],
+        dispatchable: true,
+        agent_profile: :claude,
+        native_ref: %{"pull_request" => true, "profile" => "claude", "job_id" => issue_id}
+      }
+
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+    orchestrator_name = Module.concat(__MODULE__, :ReviewLabelReconcileOrchestrator)
+    {:ok, orchestrator} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator) do
+        try do
+          GenServer.stop(orchestrator)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+
+      if Process.alive?(task_supervisor), do: Supervisor.stop(task_supervisor)
+    end)
+
+    {:ok, agent_pid} = Task.Supervisor.start_child(task_supervisor, fn -> Process.sleep(:infinity) end)
+
+    :sys.replace_state(orchestrator, fn state ->
+      %{
+        state
+        | running: %{
+            issue_id => %{
+              pid: agent_pid,
+              ref: nil,
+              identifier: issue.identifier,
+              issue: issue,
+              started_at: DateTime.utc_now()
+            }
+          },
+          claimed: MapSet.new([issue_id])
+      }
+    end)
+
+    assert :ok = Orchestrator.authorize_review_label_removal(orchestrator, issue)
+
+    label_removed_issue = %{issue | labels: ["symphony"]}
+    authorized_state = :sys.get_state(orchestrator)
+    authorized_reconciliation = Orchestrator.reconcile_issue_states_for_test([label_removed_issue], authorized_state)
+
+    assert Map.has_key?(authorized_reconciliation.running, issue_id)
+    assert Process.alive?(agent_pid)
+
+    assert :ok = Orchestrator.revoke_review_label_removal(orchestrator, issue)
+
+    externally_removed_state = :sys.get_state(orchestrator)
+
+    external_reconciliation =
+      Orchestrator.reconcile_issue_states_for_test([label_removed_issue], externally_removed_state)
+
+    refute Map.has_key?(external_reconciliation.running, issue_id)
+    refute MapSet.member?(external_reconciliation.claimed, issue_id)
+    refute Process.alive?(agent_pid)
+  end
+
+  test "GitHub review labels route without the global label and issue labels select one profile" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
+
+    review_job = %Issue{
+      id: "42@claude-review",
+      identifier: "GH-42-claude-review",
+      title: "Review PR",
+      state: "In Progress",
+      labels: ["claude-review"],
+      dispatchable: true,
+      agent_profile: :claude,
+      native_ref: %{"pull_request" => true, "profile" => "claude", "job_id" => "42@claude-review"}
+    }
+
+    assert Orchestrator.issue_routable_for_test(review_job)
+    refute Orchestrator.issue_routable_for_test(%{review_job | labels: ["codex-review"]})
+
+    claude_issue = %Issue{
+      id: "43",
+      identifier: "GH-43",
+      title: "Implement feature",
+      state: "In Progress",
+      labels: ["claude"],
+      dispatchable: true,
+      agent_profile: :claude,
+      native_ref: %{"number" => 43}
+    }
+
+    codex_issue = %{claude_issue | id: "44", agent_profile: :codex, labels: ["codex"]}
+    legacy_codex_issue = %{claude_issue | id: "45", agent_profile: :codex, labels: ["symphony"]}
+    conflicting_issue = %{claude_issue | labels: ["symphony", "claude", "codex"]}
+
+    assert Orchestrator.issue_routable_for_test(claude_issue)
+    refute Orchestrator.issue_routable_for_test(%{claude_issue | labels: ["symphony"]})
+    assert Orchestrator.issue_routable_for_test(codex_issue)
+    assert Orchestrator.issue_routable_for_test(legacy_codex_issue)
+    refute Orchestrator.issue_routable_for_test(conflicting_issue)
+  end
+
+  test "reconciliation stops a Claude issue when its profile label changes" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
+
+    issue = %Issue{
+      id: "46",
+      identifier: "GH-46",
+      title: "Claude implementation",
+      state: "In Progress",
+      labels: ["claude"],
+      dispatchable: true,
+      agent_profile: :claude,
+      native_ref: %{"number" => 46}
+    }
+
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+    {:ok, agent_pid} = Task.Supervisor.start_child(task_supervisor, fn -> Process.sleep(:infinity) end)
+
+    state = %Orchestrator.State{
+      task_supervisor: task_supervisor,
+      running: %{
+        issue.id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: issue.identifier,
+          issue: issue,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue.id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    refreshed_issue = %{issue | agent_profile: :codex, labels: ["codex"]}
+    updated_state = Orchestrator.reconcile_issue_states_for_test([refreshed_issue], state)
+
+    refute Map.has_key?(updated_state.running, issue.id)
+    refute MapSet.member?(updated_state.claimed, issue.id)
+    refute Process.alive?(agent_pid)
+    Supervisor.stop(task_supervisor)
+  end
+
+  test "reconciliation stops a legacy Codex worker when the Claude label is added" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
+
+    legacy_issue = %Issue{
+      id: "47",
+      identifier: "GH-47",
+      title: "Legacy implementation",
+      state: "In Progress",
+      labels: ["symphony"],
+      dispatchable: true,
+      agent_profile: :codex,
+      native_ref: %{"number" => 47}
+    }
+
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+    {:ok, agent_pid} = Task.Supervisor.start_child(task_supervisor, fn -> Process.sleep(:infinity) end)
+
+    state = %Orchestrator.State{
+      task_supervisor: task_supervisor,
+      running: %{
+        legacy_issue.id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: legacy_issue.identifier,
+          issue: legacy_issue,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([legacy_issue.id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    codex_labeled_issue = %{legacy_issue | labels: ["symphony", "codex"]}
+    codex_state = Orchestrator.reconcile_issue_states_for_test([codex_labeled_issue], state)
+
+    assert Map.has_key?(codex_state.running, legacy_issue.id)
+    assert Process.alive?(agent_pid)
+
+    refreshed_issue = %{legacy_issue | labels: ["symphony", "claude"], agent_profile: :claude}
+    updated_state = Orchestrator.reconcile_issue_states_for_test([refreshed_issue], codex_state)
+
+    refute Map.has_key?(updated_state.running, legacy_issue.id)
+    refute MapSet.member?(updated_state.claimed, legacy_issue.id)
+    refute Process.alive?(agent_pid)
+    Supervisor.stop(task_supervisor)
+  end
+
   test "reconcile releases a blocked issue when a required label is removed" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
 
@@ -1054,9 +1256,12 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+
+    assert %{attempt: 1, due_at_ms: due_at_ms, scheduled_at_ms: scheduled_at_ms, delay_ms: 1_000} =
+             state.retry_attempts[issue_id]
+
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert due_at_ms - scheduled_at_ms == 1_000
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1093,10 +1298,17 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 3,
+             due_at_ms: due_at_ms,
+             scheduled_at_ms: scheduled_at_ms,
+             delay_ms: 40_000,
+             identifier: "MT-559",
+             error: "agent exited: :boom"
+           } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert due_at_ms - scheduled_at_ms == 40_000
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1132,10 +1344,17 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             scheduled_at_ms: scheduled_at_ms,
+             delay_ms: 10_000,
+             identifier: "MT-560",
+             error: "agent exited: :boom"
+           } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert due_at_ms - scheduled_at_ms == 10_000
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1255,13 +1474,6 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
-  end
-
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 
@@ -1322,6 +1534,32 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+  end
+
+  test "prompt builder selects the independent review prompt for labeled pull request jobs" do
+    issue = %Issue{
+      id: "42@claude-review",
+      identifier: "GH-42-claude-review",
+      title: "Avoid stale cache entries",
+      state: "open",
+      url: "https://github.com/octo/repo/pull/42",
+      labels: ["claude-review"],
+      agent_profile: :claude,
+      native_ref: %{
+        "repo" => "octo/repo",
+        "number" => 42,
+        "pull_request" => true,
+        "head_sha" => "pinned-sha",
+        "job_id" => "42@claude-review"
+      }
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Claude, conducting an independent code review"
+    assert prompt =~ "check out the pinned head commit above"
+    assert prompt =~ "host verifies that the current PR head still matches"
+    assert prompt =~ "Remove only the `claude-review` label"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do

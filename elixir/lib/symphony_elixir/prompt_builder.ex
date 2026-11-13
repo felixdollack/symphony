@@ -9,20 +9,53 @@ defmodule SymphonyElixir.PromptBuilder do
 
   @spec build_prompt(SymphonyElixir.Tracker.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
-    template =
-      Workflow.current()
-      |> prompt_template!()
-      |> parse_template!()
+    if review_job?(issue) do
+      build_review_prompt(issue)
+    else
+      template =
+        Workflow.current()
+        |> prompt_template!()
+        |> parse_template!()
 
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
-    )
-    |> IO.iodata_to_binary()
+      template
+      |> Solid.render!(
+        %{
+          "attempt" => Keyword.get(opts, :attempt),
+          "issue" => issue |> Map.from_struct() |> to_solid_map()
+        },
+        @render_opts
+      )
+      |> IO.iodata_to_binary()
+    end
+  end
+
+  defp review_job?(%{agent_profile: profile, native_ref: %{"pull_request" => true}})
+       when profile in [:codex, :claude],
+       do: true
+
+  defp review_job?(_issue), do: false
+
+  defp build_review_prompt(issue) do
+    agent_name = if issue.agent_profile == :claude, do: "Claude", else: "Codex"
+
+    """
+    You are #{agent_name}, conducting an independent code review of GitHub pull request #{issue.identifier}.
+
+    Repository: #{issue.native_ref["repo"]}
+    Pull request: #{issue.url}
+    Title: #{issue.title}
+    Pinned head: #{issue.native_ref["head_sha"]}
+    Review marker: `<!-- symphony-review:#{issue.native_ref["job_id"]} -->`
+
+    Review the pull request diff for concrete correctness, security, and regression bugs. Do not make source changes.
+    Before reviewing, fetch `refs/pull/#{issue.native_ref["number"]}/head` and check out the pinned head commit above. Base every finding on that exact commit.
+    Report only actionable findings, with file and line references and a concise explanation of impact.
+    Publish findings through the `github_api` tool as a pull request review. Include `commit_id` equal to the pinned head and include the exact review marker in the review body. If there are inline findings, send them in the review's `comments` array.
+    The host verifies that the current PR head still matches the pinned commit and rejects stale reviews.
+    Remove only the `#{issue.agent_profile}-review` label through `github_api` after the host confirms that this job's marked review exists on the pinned head.
+    If there are no findings, publish a concise no-findings review containing the marker before removing the label.
+    """
+    |> String.trim()
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)

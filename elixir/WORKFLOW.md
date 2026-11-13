@@ -37,9 +37,13 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
+claude:
+  command: claude --print --output-format stream-json --include-partial-messages --allowedTools 'Bash(git *),Read,Glob,Grep,mcp__symphony-tracker__github_api'
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
+
+GitHub pull requests labeled `claude-review` or `codex-review` are dispatched as independent review jobs. A job checks and records the PR head before reviewing, publishes its findings, verifies the head did not change, then removes only its own review label.
 
 {% if attempt %}
 Follow-up context:

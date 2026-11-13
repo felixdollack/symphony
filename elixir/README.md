@@ -16,16 +16,16 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
    Cloud, Asana, and GitLab)
 2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
+3. Launches Codex in App Server mode or Claude Code in print mode inside the workspace
+4. Sends the issue prompt or the profile-specific pull request review prompt
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+the child processes, so the agent does not need a second tracker login. Claude jobs use
+`claude.command`; its default allows Git and workspace read tools.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -155,6 +155,11 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- GitHub pull requests labeled `claude-review` or `codex-review` are independent review jobs and
+  dispatch without `tracker.required_labels`. For ordinary GitHub issues, a `claude` or `codex`
+  label also dispatches without the global labels and selects that implementation profile. Applying
+  both profile labels makes the issue unroutable. Issues with neither profile label keep the default
+  Codex behavior, including existing `symphony`-labeled work.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -185,7 +190,8 @@ Notes:
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
-  launched shell.
+  launched shell. `claude.command` is also a shell command string, with the prompt safely appended
+  as a quoted argument.
 
 ```yaml
 tracker:
@@ -198,6 +204,8 @@ hooks:
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+claude:
+  command: "claude --print --output-format stream-json --include-partial-messages --allowedTools 'Bash(git *),Read,Glob,Grep,mcp__symphony-tracker__github_api'"
 ```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
@@ -254,13 +262,25 @@ codex:
   optional `token` (defaults to `GITHUB_TOKEN` and accepts `$VAR`), and optional `api_url`
   (default `https://api.github.com`, HTTPS only). Set explicit `active_states` and
   `terminal_states`; active entries may be `open` and terminal entries may be `closed`.
-- Reads and identity: polling is scoped to the configured repository; `issue.id` is the
-  repository issue number, `issue.identifier` is `GH-<number>`, hidden or deleted `404` issues are
-  omitted on refresh, and pull requests returned by the Issues API are not dispatchable.
+- Reads and identity: polling is scoped to the configured repository; ordinary `issue.id` is the
+  repository issue number and `issue.identifier` is `GH-<number>`. Pull requests with
+  `claude-review` and/or `codex-review` labels become independent jobs with profile-specific IDs
+  and workspaces. Hidden or deleted `404` items are omitted on refresh.
 - Tool and auth: `github_api` accepts a relative REST `path` plus optional `params` and JSON
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access
   limited by that token's GitHub permissions.
+
+### Claude Code
+
+- Configure `claude.command` to select the Claude CLI and its model and permission flags. The
+  default command uses partial `stream-json` output and allows the GitHub tracker MCP tool.
+- The default command uses Claude's partial `stream-json` output so runtime status receives text as
+  it arrives.
+- GitHub review prompts ask the agent to pin the PR head, publish findings, verify that the head
+  did not change, and remove only its own review label. The `github_api` MCP tool publishes the
+  review using Symphony's host-side credentials; Symphony rejects reviews whose commit differs
+  from the pinned/current PR head.
 
 ### Jira Cloud adapter
 

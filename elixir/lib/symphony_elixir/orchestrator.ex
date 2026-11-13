@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.GitHub.ReviewJob
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -50,6 +51,28 @@ defmodule SymphonyElixir.Orchestrator do
     name = Keyword.get(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
+
+  @doc false
+  @spec authorize_review_label_removal(pid() | nil, Issue.t()) :: :ok | {:error, term()}
+  def authorize_review_label_removal(orchestrator, %Issue{id: issue_id} = issue)
+      when is_pid(orchestrator) and is_binary(issue_id) do
+    GenServer.call(orchestrator, {:review_label_removal_transition, issue, :authorize})
+  catch
+    :exit, reason -> {:error, {:orchestrator_unavailable, reason}}
+  end
+
+  def authorize_review_label_removal(_orchestrator, _issue), do: {:error, :orchestrator_unavailable}
+
+  @doc false
+  @spec revoke_review_label_removal(pid() | nil, Issue.t()) :: :ok | {:error, term()}
+  def revoke_review_label_removal(orchestrator, %Issue{id: issue_id} = issue)
+      when is_pid(orchestrator) and is_binary(issue_id) do
+    GenServer.call(orchestrator, {:review_label_removal_transition, issue, :revoke})
+  catch
+    :exit, reason -> {:error, {:orchestrator_unavailable, reason}}
+  end
+
+  def revoke_review_label_removal(_orchestrator, _issue), do: {:error, :orchestrator_unavailable}
 
   @impl true
   def init(opts) do
@@ -373,6 +396,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec issue_routable_for_test(Issue.t()) :: boolean()
+  def issue_routable_for_test(%Issue{} = issue), do: issue_routable?(issue)
+
+  @doc false
   @spec handle_retry_issue_lookup_for_test(Issue.t(), term(), String.t(), non_neg_integer(), map()) ::
           term()
   def handle_retry_issue_lookup_for_test(%Issue{} = issue, %State{} = state, issue_id, attempt, metadata)
@@ -425,7 +452,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true)
 
-      !issue_routable?(issue) ->
+      !running_issue_routable?(issue, state) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
@@ -460,7 +487,7 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
         release_issue_claim(state, issue.id)
 
-      !issue_routable?(issue) ->
+      !running_issue_routable?(issue, state) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
 
@@ -870,8 +897,48 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    cond do
+      ReviewJob.label(issue) != nil ->
+        ReviewJob.routable?(issue)
+
+      ReviewJob.implementation_label_present?(issue) ->
+        ReviewJob.routable?(issue)
+
+      true ->
+        Issue.routable?(issue, Config.settings!().tracker.required_labels) and ReviewJob.routable?(issue)
+    end
   end
+
+  defp running_issue_routable?(%Issue{} = issue, state) do
+    review_label = ReviewJob.label(issue)
+    running_entry = Map.get(state.running, issue.id, %{})
+    review_label_removal_authorized? = Map.get(running_entry, :review_label_removal_authorized, false)
+
+    if review_label do
+      ReviewJob.label_present?(issue) or review_label_removal_authorized?
+    else
+      running_issue_has_selected_profile?(issue, running_entry) and
+        ReviewJob.routable?(issue) and
+        (ReviewJob.implementation_label_present?(issue) or
+           Issue.routable?(issue, Config.settings!().tracker.required_labels))
+    end
+  end
+
+  defp running_issue_has_selected_profile?(%Issue{} = current_issue, running_entry) do
+    case Map.get(running_entry, :issue) do
+      %Issue{} = running_issue ->
+        normalize_agent_profile(current_issue.agent_profile) ==
+          normalize_agent_profile(running_issue.agent_profile) and
+          (not ReviewJob.implementation_label_present?(running_issue) or
+             ReviewJob.implementation_label_present?(current_issue))
+
+      _ ->
+        true
+    end
+  end
+
+  defp normalize_agent_profile(:claude), do: :claude
+  defp normalize_agent_profile(_profile), do: :codex
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -1038,7 +1105,8 @@ defmodule SymphonyElixir.Orchestrator do
     delay_ms = retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+    scheduled_at_ms = System.monotonic_time(:millisecond)
+    due_at_ms = scheduled_at_ms + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     issue_url = pick_retry_issue_url(previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
@@ -1062,6 +1130,8 @@ defmodule SymphonyElixir.Orchestrator do
             attempt: next_attempt,
             timer_ref: timer_ref,
             retry_token: retry_token,
+            scheduled_at_ms: scheduled_at_ms,
+            delay_ms: delay_ms,
             due_at_ms: due_at_ms,
             identifier: identifier,
             issue_url: issue_url,
@@ -1406,6 +1476,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:review_label_removal_transition, %Issue{id: issue_id} = issue, action}, _from, state)
+      when action in [:authorize, :revoke] do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{agent_profile: profile}} = running_entry when profile == issue.agent_profile ->
+        updated_entry = Map.put(running_entry, :review_label_removal_authorized, action == :authorize)
+        notify_dashboard()
+        {:reply, :ok, %{state | running: Map.put(state.running, issue_id, updated_entry)}}
+
+      _ ->
+        {:reply, {:error, :review_job_not_running}, state}
+    end
+  end
+
+  @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -1640,7 +1724,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states)
+    candidate_issue?(issue, active_state_set(), terminal_states) and ReviewJob.routable?(issue)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

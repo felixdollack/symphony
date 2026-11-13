@@ -4,6 +4,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
   alias SymphonyElixir.GitHub.AgentTool, as: GitHubAgentTool
   alias SymphonyElixir.GitHub.Client, as: GitHubClient
+  alias SymphonyElixir.GitHub.ReviewJob
 
   defmodule FakeGitHubClient do
     def fetch_issues_by_states(states) do
@@ -112,7 +113,8 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              "id" => 1_042,
              "node_id" => "I_42",
              "number" => 42,
-             "repo" => "octo/repo"
+             "repo" => "octo/repo",
+             "pull_request" => false
            }
 
     assert issue.title == "Issue 42"
@@ -135,6 +137,90 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              Map.put(raw_issue(44), "title", " "),
              "octo/repo"
            ) == nil
+  end
+
+  test "GitHub pull requests become independent jobs for each review label" do
+    issue =
+      GitHubClient.normalize_issue_for_test(
+        raw_issue(42)
+        |> Map.put("pull_request", %{"url" => "https://api.github.test/pulls/42"})
+        |> Map.put("labels", [%{"name" => "claude-review"}, %{"name" => "codex-review"}]),
+        "octo/repo"
+      )
+      |> then(&%{&1 | native_ref: Map.put(&1.native_ref, "head_sha", "pinned-sha")})
+
+    assert [%{id: "42@claude-review", agent_profile: :claude} = claude, %{id: "42@codex-review", agent_profile: :codex} = codex] =
+             ReviewJob.expand(issue)
+
+    assert claude.identifier == "GH-42-claude-review"
+    assert codex.identifier == "GH-42-codex-review"
+    assert claude.native_ref["number"] == 42
+    assert codex.native_ref["number"] == 42
+    assert claude.dispatchable and codex.dispatchable
+
+    assert [%{id: "42@claude-review", agent_profile: :claude}] =
+             ReviewJob.select_requested([issue], ["42@claude-review"])
+
+    unlabeled_issue = %{issue | labels: []}
+
+    [active_job] =
+      ReviewJob.select_requested(
+        [unlabeled_issue],
+        ["42@claude-review"]
+      )
+
+    refute ReviewJob.routable?(active_job)
+  end
+
+  test "GitHub pull requests without review labels are not dispatchable" do
+    issue =
+      GitHubClient.normalize_issue_for_test(
+        raw_issue(42)
+        |> Map.put("pull_request", %{"url" => "https://api.github.test/pulls/42"}),
+        "octo/repo"
+      )
+
+    assert ReviewJob.expand(issue) == []
+  end
+
+  test "ReviewJob handles non-PR work items and malformed review identities" do
+    regular_issue = %Issue{
+      id: "issue-7",
+      native_ref: %{"id" => 7},
+      labels: [],
+      dispatchable: true
+    }
+
+    assert [%Issue{id: "issue-7", agent_profile: :codex}] = ReviewJob.expand(regular_issue)
+
+    claude_issue = %{regular_issue | labels: ["claude"]}
+    assert [%Issue{id: "issue-7", agent_profile: :claude}] = ReviewJob.expand(claude_issue)
+
+    conflicting_issue = %{regular_issue | labels: ["claude", "codex"]}
+    assert ReviewJob.expand(conflicting_issue) == []
+
+    assert ReviewJob.expand(%Issue{}) == []
+    assert ReviewJob.for_profile(regular_issue, :unknown) == nil
+    assert ReviewJob.routable?(regular_issue)
+    assert ReviewJob.label_present?(regular_issue)
+    assert ReviewJob.marker(regular_issue) == nil
+
+    pr_job = %Issue{
+      id: "42@codex-review",
+      agent_profile: :codex,
+      native_ref: %{"pull_request" => true, "job_id" => "42@codex-review"}
+    }
+
+    assert ReviewJob.marker(pr_job) == "<!-- symphony-review:42@codex-review -->"
+    assert ReviewJob.parse_review_id("42@codex-review") == {:ok, "42", :codex}
+    assert ReviewJob.parse_review_id("42@unsupported") == :error
+
+    assert ReviewJob.select_requested([regular_issue], ["not-a-number@claude-review"]) == []
+    assert ReviewJob.select_requested([regular_issue], ["missing-issue"]) == []
+    assert ReviewJob.select_requested([regular_issue], ["99@claude-review"]) == []
+
+    assert [%Issue{id: "issue-7", agent_profile: :codex}] =
+             ReviewJob.select_requested([regular_issue], ["issue-7"])
   end
 
   test "client pages state reads, filters requested states, and drops malformed records" do
@@ -369,6 +455,526 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     assert non_json_body["success"]
     assert non_json_body["output"] =~ "#PID"
+
+    unknown_payload =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "GET", "path" => "/user"},
+        github_client: fn _method, _path, _params, _body, _opts -> :unexpected end
+      )
+
+    refute unknown_payload["success"]
+    assert Jason.decode!(unknown_payload["output"])["error"]["reason"] == ":github_unknown_payload"
+  end
+
+  test "github review jobs reject out-of-scope API paths and malformed review entries" do
+    issue = review_issue_for_test()
+
+    out_of_scope =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "GET", "path" => "/repos/octo/other/pulls/99"},
+        issue: issue,
+        github_client: fn _method, _path, _params, _body, _opts ->
+          flunk("out-of-scope review requests must not reach GitHub")
+        end
+      )
+
+    refute out_of_scope["success"]
+    assert Jason.decode!(out_of_scope["output"])["error"]["message"] =~ "outside the current pull request"
+
+    invalid_review =
+      delete_review_label(
+        issue,
+        fn _issue, _action -> :ok end,
+        fn method, path, _params, _body, _opts ->
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => "expected-sha"}}}}
+
+            {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+              {:ok, %{status: 200, body: [nil]}}
+          end
+        end
+      )
+
+    refute invalid_review["success"]
+    assert Jason.decode!(invalid_review["output"])["error"]["message"] =~ "cannot be removed"
+  end
+
+  test "github_api allows read-only PR review endpoints within the current job" do
+    issue = review_issue_for_test()
+
+    for path <- [
+          "/repos/octo/repo/pulls/42/files",
+          "/repos/octo/repo/pulls/42/commits",
+          "/repos/octo/repo/pulls/42/reviews",
+          "/repos/octo/repo/pulls/42/comments",
+          "/repos/octo/repo/issues/42",
+          "/repos/octo/repo/issues/42/comments"
+        ] do
+      response =
+        GitHubAgentTool.execute(
+          "github_api",
+          %{"method" => "GET", "path" => path},
+          issue: issue,
+          github_client: fn "GET", ^path, _params, _body, _opts ->
+            {:ok, %{status: 200, body: []}}
+          end
+        )
+
+      assert response["success"]
+    end
+  end
+
+  test "github_api handles profile-scoped label transitions and callback failures" do
+    issue = review_issue_for_test()
+
+    authorize_error =
+      delete_review_label(
+        issue,
+        fn _issue, :authorize -> {:error, :orchestrator_unavailable} end,
+        &valid_review_delete_response/5
+      )
+
+    refute authorize_error["success"]
+    assert authorize_error["output"] =~ "could not authorize this review-label transition"
+
+    unexpected_authorization =
+      delete_review_label(issue, fn _issue, :authorize -> :unexpected end, &valid_review_delete_response/5)
+
+    refute unexpected_authorization["success"]
+
+    completion_callback_error =
+      delete_review_label(
+        issue,
+        fn _issue, action -> if action == :authorize, do: :ok, else: {:error, :orchestrator_stopped} end,
+        &valid_review_delete_response/5
+      )
+
+    assert completion_callback_error["success"]
+
+    completion_callback_unexpected =
+      delete_review_label(
+        issue,
+        fn _issue, action -> if action == :authorize, do: :ok, else: :unexpected end,
+        &valid_review_delete_response/5
+      )
+
+    assert completion_callback_unexpected["success"]
+  end
+
+  test "github_api deletes only the Codex label for a Codex review job" do
+    issue = %{
+      review_issue_for_test()
+      | agent_profile: :codex,
+        native_ref: %{
+          "repo" => "octo/repo",
+          "number" => 42,
+          "pull_request" => true,
+          "head_sha" => "expected-sha",
+          "job_id" => "42@codex-review",
+          "profile" => "codex"
+        }
+    }
+
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/42/labels/codex-review"},
+        issue: issue,
+        on_review_label_removal: fn _issue, _action -> :ok end,
+        github_client: fn method, path, _params, _body, _opts ->
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => "expected-sha"}}}}
+
+            {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+              {:ok,
+               %{
+                 status: 200,
+                 body: [
+                   %{
+                     "commit_id" => "expected-sha",
+                     "state" => "COMMENTED",
+                     "body" => "Review <!-- symphony-review:42@codex-review -->"
+                   }
+                 ]
+               }}
+
+            {"DELETE", "/repos/octo/repo/issues/42/labels/codex-review"} ->
+              {:ok, %{status: 200, body: %{}}}
+          end
+        end
+      )
+
+    assert response["success"]
+  end
+
+  test "github_api treats a non-review issue label deletion as an ordinary REST request" do
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/9/labels/symphony"},
+        issue: %Issue{native_ref: %{"repo" => "octo/repo", "number" => 9}},
+        github_client: fn "DELETE", _path, _params, _body, _opts ->
+          {:ok, %{status: 200, body: %{}}}
+        end
+      )
+
+    assert response["success"]
+  end
+
+  test "github_api refuses to publish a review against a stale PR head" do
+    issue = %Issue{
+      native_ref: %{
+        "repo" => "octo/repo",
+        "number" => 42,
+        "pull_request" => true,
+        "head_sha" => "expected-sha",
+        "job_id" => "42@codex-review",
+        "profile" => "codex"
+      }
+    }
+
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{
+          "method" => "POST",
+          "path" => "/repos/octo/repo/pulls/42/reviews",
+          "body" => %{
+            "commit_id" => "expected-sha",
+            "body" => "Finding <!-- symphony-review:42@codex-review -->"
+          }
+        },
+        issue: issue,
+        github_client: fn method, path, _params, _body, _opts ->
+          send(self(), {:github_request, method, path})
+
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => "new-sha"}}}}
+
+            _ ->
+              flunk("a stale review must not be posted")
+          end
+        end
+      )
+
+    refute response["success"]
+    assert response["output"] =~ "current pull request head"
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    refute_receive {:github_request, "POST", _path}
+  end
+
+  test "github_api removes only its own label after a marked current-head review exists" do
+    issue = %Issue{
+      agent_profile: :claude,
+      native_ref: %{
+        "repo" => "octo/repo",
+        "number" => 42,
+        "pull_request" => true,
+        "head_sha" => "expected-sha",
+        "job_id" => "42@claude-review",
+        "profile" => "claude"
+      }
+    }
+
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{
+          "method" => "DELETE",
+          "path" => "/repos/octo/repo/issues/42/labels/claude-review"
+        },
+        issue: issue,
+        on_review_label_removal: fn _issue, action ->
+          send(self(), {:label_transition, action})
+          :ok
+        end,
+        github_client: fn method, path, _params, _body, _opts ->
+          send(self(), {:github_request, method, path})
+
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => "expected-sha"}}}}
+
+            {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+              {:ok,
+               %{
+                 status: 200,
+                 body: [
+                   %{
+                     "commit_id" => "expected-sha",
+                     "state" => "COMMENTED",
+                     "body" => "Review <!-- symphony-review:42@claude-review -->"
+                   }
+                 ]
+               }}
+
+            {"DELETE", "/repos/octo/repo/issues/42/labels/claude-review"} ->
+              {:ok, %{status: 200, body: %{}}}
+
+            _ ->
+              flunk("unexpected GitHub API request")
+          end
+        end
+      )
+
+    assert response["success"]
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42/reviews"}
+    assert_receive {:github_request, "DELETE", "/repos/octo/repo/issues/42/labels/claude-review"}
+    assert_receive {:label_transition, :authorize}
+    assert_receive {:label_transition, :complete}
+  end
+
+  test "github_api requires an orchestrator transition callback before removing a review label" do
+    issue = review_issue_for_test()
+
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/42/labels/claude-review"},
+        issue: issue,
+        github_client: fn method, path, _params, _body, _opts ->
+          send(self(), {:github_request, method, path})
+
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => "expected-sha"}}}}
+
+            {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+              {:ok, %{status: 200, body: [commented_review_for_test()]}}
+
+            _ ->
+              flunk("label removal must be blocked without an orchestrator transition")
+          end
+        end
+      )
+
+    refute response["success"]
+    assert response["output"] =~ "could not authorize this review-label transition"
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42/reviews"}
+    refute_receive {:github_request, "DELETE", _path}
+  end
+
+  test "github_api refuses to remove a label when the job has no pinned head" do
+    issue = %{review_issue_for_test() | native_ref: Map.delete(review_issue_for_test().native_ref, "head_sha")}
+
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/42/labels/claude-review"},
+        issue: issue,
+        github_client: fn _method, _path, _params, _body, _opts ->
+          flunk("a review without a pinned head cannot remove its label")
+        end
+      )
+
+    refute response["success"]
+    assert response["output"] =~ "pinned PR head"
+  end
+
+  test "github_api restores the review label when the head changes during label removal" do
+    issue = review_issue_for_test()
+    head_reads = Agent.start_link(fn -> 0 end) |> elem(1)
+
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/42/labels/claude-review"},
+        issue: issue,
+        on_review_label_removal: fn _issue, action ->
+          send(self(), {:label_transition, action})
+          :ok
+        end,
+        github_client: fn method, path, _params, _body, _opts ->
+          send(self(), {:github_request, method, path})
+
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              sha = Agent.get_and_update(head_reads, fn reads -> {if(reads == 0, do: "expected-sha", else: "changed-sha"), reads + 1} end)
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => sha}}}}
+
+            {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+              {:ok, %{status: 200, body: [commented_review_for_test()]}}
+
+            {"DELETE", "/repos/octo/repo/issues/42/labels/claude-review"} ->
+              {:ok, %{status: 200, body: %{}}}
+
+            {"POST", "/repos/octo/repo/issues/42/labels"} ->
+              {:ok, %{status: 200, body: [%{"name" => "claude-review"}]}}
+          end
+        end
+      )
+
+    refute response["success"]
+    assert response["output"] =~ "current pull request head"
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42/reviews"}
+    assert_receive {:github_request, "DELETE", "/repos/octo/repo/issues/42/labels/claude-review"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    assert_receive {:github_request, "POST", "/repos/octo/repo/issues/42/labels"}
+    assert_receive {:label_transition, :authorize}
+    assert_receive {:label_transition, :revoke}
+  end
+
+  test "github_api reports failure when it cannot restore a stale review label" do
+    issue = review_issue_for_test()
+    head_reads = Agent.start_link(fn -> 0 end) |> elem(1)
+
+    response =
+      delete_review_label(
+        issue,
+        fn _issue, _action -> :ok end,
+        fn method, path, _params, _body, _opts ->
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              sha = Agent.get_and_update(head_reads, fn reads -> {if(reads == 0, do: "expected-sha", else: "changed-sha"), reads + 1} end)
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => sha}}}}
+
+            {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+              {:ok, %{status: 200, body: [commented_review_for_test()]}}
+
+            {"DELETE", "/repos/octo/repo/issues/42/labels/claude-review"} ->
+              {:ok, %{status: 200, body: %{}}}
+
+            {"POST", "/repos/octo/repo/issues/42/labels"} ->
+              {:error, :forbidden}
+          end
+        end
+      )
+
+    refute response["success"]
+    assert response["output"] =~ "current pull request head"
+  end
+
+  test "github_api does not remove the review label for a pending review" do
+    issue = review_issue_for_test()
+
+    response =
+      GitHubAgentTool.execute(
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/42/labels/claude-review"},
+        issue: issue,
+        github_client: fn method, path, _params, _body, _opts ->
+          send(self(), {:github_request, method, path})
+
+          case {method, path} do
+            {"GET", "/repos/octo/repo/pulls/42"} ->
+              {:ok, %{status: 200, body: %{"head" => %{"sha" => "expected-sha"}}}}
+
+            {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+              {:ok,
+               %{
+                 status: 200,
+                 body: [Map.put(commented_review_for_test(), "state", "PENDING")]
+               }}
+
+            _ ->
+              flunk("pending reviews must not remove the label")
+          end
+        end
+      )
+
+    refute response["success"]
+    assert response["output"] =~ "review is published"
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42/reviews"}
+    refute_receive {:github_request, "DELETE", _path}
+  end
+
+  test "completion verification requires the review, pinned head, and removed job label" do
+    issue = %Issue{
+      agent_profile: :claude,
+      native_ref: %{
+        "repo" => "octo/repo",
+        "number" => 42,
+        "pull_request" => true,
+        "head_sha" => "expected-sha",
+        "job_id" => "42@claude-review",
+        "profile" => "claude"
+      }
+    }
+
+    request_fun = fn method, path, _params, body, _settings ->
+      send(self(), {:github_request, method, path})
+
+      case {method, path} do
+        {"GET", "/repos/octo/repo/issues/42"} ->
+          {:ok, %{status: 200, body: %{"labels" => [%{"name" => "symphony"}]}}}
+
+        {"GET", "/repos/octo/repo/pulls/42"} ->
+          {:ok, %{status: 200, body: %{"head" => %{"sha" => "expected-sha"}}}}
+
+        {"POST", "/repos/octo/repo/issues/42/labels"} ->
+          assert body == %{"labels" => ["claude-review"]}
+          {:ok, %{status: 200, body: [%{"name" => "claude-review"}]}}
+
+        {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+          {:ok,
+           %{
+             status: 200,
+             body: [
+               %{
+                 "commit_id" => "expected-sha",
+                 "state" => "COMMENTED",
+                 "body" => "No findings <!-- symphony-review:42@claude-review -->"
+               }
+             ]
+           }}
+      end
+    end
+
+    assert :ok = GitHubClient.verify_review_completion_for_test(issue, tracker_settings(), request_fun)
+    assert_receive {:github_request, "GET", "/repos/octo/repo/issues/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42/reviews"}
+
+    stale_request_fun = fn method, path, params, body, settings ->
+      case {method, path} do
+        {"GET", "/repos/octo/repo/pulls/42"} ->
+          send(self(), {:github_request, method, path})
+          {:ok, %{status: 200, body: %{"head" => %{"sha" => "changed-sha"}}}}
+
+        _ ->
+          request_fun.(method, path, params, body, settings)
+      end
+    end
+
+    assert {:error, :github_review_not_completed} =
+             GitHubClient.verify_review_completion_for_test(issue, tracker_settings(), stale_request_fun)
+
+    assert_receive {:github_request, "GET", "/repos/octo/repo/issues/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42"}
+    assert_receive {:github_request, "GET", "/repos/octo/repo/pulls/42/reviews"}
+    assert_receive {:github_request, "POST", "/repos/octo/repo/issues/42/labels"}
+  end
+
+  test "completion verification reports a failed label restore when GitHub returns 404" do
+    issue = review_issue_for_test()
+
+    request_fun = fn method, path, _params, _body, _settings ->
+      case {method, path} do
+        {"GET", "/repos/octo/repo/issues/42"} ->
+          {:ok, %{status: 200, body: %{"labels" => [%{"name" => "symphony"}]}}}
+
+        {"GET", "/repos/octo/repo/pulls/42"} ->
+          {:ok, %{status: 200, body: %{"head" => %{"sha" => "changed-sha"}}}}
+
+        {"GET", "/repos/octo/repo/pulls/42/reviews"} ->
+          {:ok, %{status: 200, body: []}}
+
+        {"POST", "/repos/octo/repo/issues/42/labels"} ->
+          {:ok, %{status: 404, body: %{"message" => "Not Found"}}}
+      end
+    end
+
+    assert {:error, {:github_review_label_restore_failed, {:github_api_status, 404}}} =
+             GitHubClient.verify_review_completion_for_test(issue, tracker_settings(), request_fun)
   end
 
   test "tracker binds GitHub tools and token env names from provider config" do
@@ -409,6 +1015,63 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
         ),
       active_states: ["open"],
       terminal_states: ["closed"]
+    }
+  end
+
+  defp review_issue_for_test do
+    %Issue{
+      agent_profile: :claude,
+      native_ref: %{
+        "repo" => "octo/repo",
+        "number" => 42,
+        "pull_request" => true,
+        "head_sha" => "expected-sha",
+        "job_id" => "42@claude-review",
+        "profile" => "claude"
+      }
+    }
+  end
+
+  defp delete_review_label(issue, callback, github_client) do
+    label = "#{issue.agent_profile}-review"
+
+    GitHubAgentTool.execute(
+      "github_api",
+      %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/42/labels/#{label}"},
+      issue: issue,
+      on_review_label_removal: callback,
+      github_client: github_client
+    )
+  end
+
+  defp valid_review_delete_response("GET", "/repos/octo/repo/pulls/42", _params, _body, _opts) do
+    {:ok, %{status: 200, body: %{"head" => %{"sha" => "expected-sha"}}}}
+  end
+
+  defp valid_review_delete_response("GET", "/repos/octo/repo/pulls/42/reviews", _params, _body, _opts) do
+    {:ok, %{status: 200, body: [commented_review_for_test()]}}
+  end
+
+  defp valid_review_delete_response("DELETE", path, _params, _body, _opts) do
+    if path in [
+         "/repos/octo/repo/issues/42/labels/claude-review",
+         "/repos/octo/repo/issues/42/labels/codex-review"
+       ] do
+      {:ok, %{status: 200, body: %{}}}
+    else
+      flunk("unexpected GitHub label deletion path: #{path}")
+    end
+  end
+
+  defp valid_review_delete_response(method, path, _params, _body, _opts) do
+    flunk("unexpected GitHub request #{method} #{path}")
+  end
+
+  defp commented_review_for_test do
+    %{
+      "commit_id" => "expected-sha",
+      "state" => "COMMENTED",
+      "body" => "Review <!-- symphony-review:42@claude-review -->"
     }
   end
 

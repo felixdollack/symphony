@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Workspace do
 
   require Logger
   alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.Tracker.Issue
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -34,6 +35,112 @@ defmodule SymphonyElixir.Workspace do
       error in [ArgumentError, ErlangError, File.Error] ->
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
         {:error, error}
+    end
+  end
+
+  @spec checkout_review_head(Path.t(), Issue.t(), worker_host()) :: :ok | {:error, term()}
+  def checkout_review_head(workspace, %Issue{native_ref: native_ref}, worker_host)
+      when is_binary(workspace) and is_map(native_ref) do
+    number = native_ref["number"]
+    sha = native_ref["head_sha"]
+    expected_repo = native_ref["repo"]
+
+    if is_integer(number) and number > 0 and is_binary(sha) and
+         String.match?(sha, ~r/\A[0-9a-fA-F]{40,64}\z/) and is_binary(expected_repo) do
+      script =
+        "git fetch --no-tags origin refs/pull/#{number}/head && " <>
+          "git checkout --detach #{shell_escape(sha)} && " <>
+          "git submodule update --init --recursive && " <>
+          "test \"$(git rev-parse HEAD)\" = #{shell_escape(sha)}"
+
+      with :ok <- verify_workspace_repository(workspace, worker_host, expected_repo) do
+        run_review_checkout(script, workspace, worker_host)
+      end
+    else
+      {:error, :invalid_pull_request_head}
+    end
+  end
+
+  def checkout_review_head(_workspace, _issue, _worker_host), do: {:error, :invalid_pull_request_head}
+
+  defp verify_workspace_repository(workspace, nil, expected_repo) do
+    case System.cmd("git", ["remote", "get-url", "origin"], cd: workspace, stderr_to_stdout: true) do
+      {remote, 0} -> repository_match(remote, expected_repo)
+      {_output, _status} -> {:error, :workspace_origin_missing}
+    end
+  rescue
+    error in [ErlangError, File.Error] -> {:error, {:workspace_origin_unavailable, error}}
+  end
+
+  defp verify_workspace_repository(workspace, worker_host, expected_repo) when is_binary(worker_host) do
+    command = "cd #{shell_escape(workspace)} && git remote get-url origin"
+
+    case run_remote_command(worker_host, command, Config.settings!().hooks.timeout_ms) do
+      {:ok, {remote, 0}} -> repository_match(remote, expected_repo)
+      _ -> {:error, :workspace_origin_missing}
+    end
+  end
+
+  defp repository_match(remote, expected_repo) do
+    remote_repo = remote |> String.trim() |> remote_repo_path()
+
+    if String.downcase(remote_repo) == String.downcase(expected_repo) do
+      :ok
+    else
+      {:error, {:workspace_repository_mismatch, expected_repo, remote_repo}}
+    end
+  end
+
+  defp remote_repo_path("git@" <> remote) do
+    case String.split(remote, ":", parts: 2) do
+      [_host, path] -> normalize_remote_repo_path(path)
+      _ -> ""
+    end
+  end
+
+  defp remote_repo_path(remote) do
+    path = URI.parse(remote).path || remote
+    normalize_remote_repo_path(path)
+  end
+
+  defp normalize_remote_repo_path(path) do
+    parts =
+      path
+      |> Path.split()
+      |> Enum.reject(&(&1 in ["", "/"]))
+
+    parts
+    |> Enum.take(-2)
+    |> Enum.join("/")
+    |> String.trim_trailing(".git")
+  end
+
+  defp run_review_checkout(script, workspace, nil) do
+    timeout_ms = Config.settings!().hooks.timeout_ms
+    task = Task.async(fn -> System.cmd("bash", ["-lc", script], cd: workspace, stderr_to_stdout: true) end)
+
+    case Task.yield(task, timeout_ms) do
+      {:ok, {_output, 0}} ->
+        :ok
+
+      {:ok, {output, status}} ->
+        {:error, {:pull_request_checkout_failed, status, output}}
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, {:pull_request_checkout_timeout, timeout_ms}}
+    end
+  rescue
+    error in [ErlangError, File.Error] -> {:error, {:pull_request_checkout_failed, error}}
+  end
+
+  defp run_review_checkout(script, workspace, worker_host) when is_binary(worker_host) do
+    command = "cd #{shell_escape(workspace)} && #{script}"
+
+    case run_remote_command(worker_host, command, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:pull_request_checkout_failed, status, output}}
+      {:error, reason} -> {:error, {:pull_request_checkout_failed, reason}}
     end
   end
 
